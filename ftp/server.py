@@ -1,254 +1,405 @@
-from asyncio import Future, wait_for, gather, TimeoutError, shield, CancelledError, start_server, create_task, wait, Queue, current_task, get_running_loop, FIRST_COMPLETED
-from collections import defaultdict
-from enum import Enum
-from functools import wraps, partial
-from pathlib import PurePosixPath, Path
-from socket import AF_INET, AF_INET6
-from stat import filemode
-from time import strftime, gmtime, time, localtime
-from chardet import detect as cdetect
+from asyncio import Future, wait_for, gather, TimeoutError, shield, CancelledError, start_server, create_task, wait, Queue, current_task, get_running_loop, FIRST_COMPLETED  
+# Ferramentas para manipulação de tarefas e operações assíncronas:
+# Future: Representa o resultado de uma operação assíncrona.
+# wait_for: Espera uma operação assíncrona com limite de tempo.
+# gather: Executa múltiplas tarefas assíncronas simultaneamente.
+# TimeoutError: Exceção para tempo limite excedido.
+# shield: Protege tarefas de serem canceladas.
+# CancelledError: Exceção para tarefas canceladas.
+# start_server: Inicia um servidor assíncrono.
+# create_task: Cria uma nova tarefa assíncrona.
+# wait: Aguarda múltiplas tarefas serem concluídas.
+# Queue: Implementa filas assíncronas.
+# current_task: Obtém a tarefa atual em execução.
+# get_running_loop: Obtém o loop de eventos ativo.
+# FIRST_COMPLETED: Espera até que a primeira tarefa seja concluída.
 
-from .errors import PathIOError, NoAvailablePort
-from .pathio import PathIONursery
-from .common import StreamIO, setlocale, wrap_with_container
+from collections import defaultdict  # Cria dicionários com valores padrão para chaves inexistentes.
+
+from enum import Enum  # Define conjuntos de constantes nomeadas.
+
+from functools import wraps, partial  
+# wraps: Preserva metadados de funções decoradas.
+# partial: Cria funções parcialmente aplicadas (com argumentos fixos).
+
+from pathlib import PurePosixPath, Path  
+# PurePosixPath: Representa caminhos no estilo POSIX.
+# Path: Classe de alto nível para manipular caminhos de arquivos.
+
+from socket import AF_INET, AF_INET6  
+# AF_INET: Família de endereços para IPv4.
+# AF_INET6: Família de endereços para IPv6.
+
+from stat import filemode  # Converte permissões de arquivos em formato legível.
+
+from time import strftime, gmtime, time, localtime  
+# strftime: Formata a data/hora como string.
+# gmtime: Converte timestamp para UTC.
+# time: Retorna o timestamp atual.
+# localtime: Converte timestamp para o horário local.
+
+from chardet import detect as cdetect  # Detecta a codificação de texto (usado para identificar encoding de arquivos).
+
+from .errors import PathIOError, NoAvailablePort  
+# PathIOError: Exceção para erros relacionados a operações de entrada/saída.
+# NoAvailablePort: Exceção quando nenhuma porta está disponível.
+
+from .pathio import PathIONursery  # Gerencia operações de entrada e saída de arquivos.
+
+from .common import StreamIO, setlocale, wrap_with_container  
+# StreamIO: Gerencia fluxos de entrada e saída.
+# setlocale: Configura a localidade do sistema.
+# wrap_with_container: Envolve dados em um contêiner específico.
 
 __all__ = (
-    "Permission",
-    "User",
-    "AbstractUserManager",
-    "MongoDBUserManager",
-    "Connection",
-    "AvailableConnections",
-    "ConnectionConditions",
-    "PathConditions",
-    "PathPermissions",
-    "worker",
-    "Server",
+    "Permission",              # Representa permissões de acesso.
+    "User",                    # Classe que define um usuário.
+    "AbstractUserManager",     # Classe base para gerenciar usuários.
+    "MongoDBUserManager",      # Implementação de gerenciador de usuários usando MongoDB.
+    "Connection",              # Representa uma conexão.
+    "AvailableConnections",    # Gerencia conexões disponíveis.
+    "ConnectionConditions",    # Define condições específicas para conexões.
+    "PathConditions",          # Define condições relacionadas a caminhos.
+    "PathPermissions",         # Gerencia permissões para caminhos.
+    "worker",                  # Representa uma unidade de trabalho (e.g., tarefa assíncrona).
+    "Server",                  # Classe que implementa o servidor FTP.
 )
 
-class Permission:
-    def __init__(self, path="/", *, readable=False, writable=False):
-        self.path = PurePosixPath(path)
-        self.readable = readable or writable
-        self.writable = writable
 
-    def is_parent(self, other):
-        try:
-            other.relative_to(self.path)
-            return True
-        except ValueError:
-            return False
+class Permission:  
+    # Classe que representa permissões de acesso para um caminho específico.
 
-class User:
-    def __init__(self, login, password, permissions=[]):
-        self.login = login
-        self.password = password
-        self.base_path = Path(".")
-        self.home_path = PurePosixPath(f"/{login}")
-        self.permissions = [Permission(f"/{login}", readable=True, writable=True)]
-        self.permissions += permissions
-        if not [p for p in self.permissions if p.path == PurePosixPath("/")]:
-            self.permissions.append(Permission("/", readable=False, writable=False))
+    def __init__(self, path="/", *, readable=False, writable=False):  
+        # Inicializa a permissão com um caminho base e permissões de leitura e escrita.
+        self.path = PurePosixPath(path)  
+        # Converte o caminho fornecido para o formato POSIX padrão.
+        self.readable = readable or writable  
+        # Permite leitura se a permissão de gravação for ativada.
+        self.writable = writable  
+        # Define se o caminho é gravável.
 
-    def get_permissions(self, path):
-        path = PurePosixPath(path)
-        parents = filter(lambda p: p.is_parent(path), self.permissions)
-        perm = min(parents, key=lambda p: len(path.relative_to(p.path).parts), default=Permission())
-        return perm
+    def is_parent(self, other):  
+        # Verifica se o caminho atual é pai de outro caminho.
+        try:  
+            other.relative_to(self.path)  
+            # Retorna True se 'other' for um subcaminho de 'self.path'.
+            return True  
+        except ValueError:  
+            # Retorna False se 'other' não for relativo a 'self.path'.
+            return False  
 
-    def update(self, d):
-        self.password = d.password or self.password
-        self.permissions.clear()
-        self.permissions = [Permission(f"/{self.login}", readable=True, writable=True)]
-        for perm in d.permissions:
-            self.permissions.append(perm)
-        return self
+class User:  
+    # Classe que representa um usuário com login, senha e permissões de acesso.
 
-    @classmethod
-    def from_dict(cls, d):
-        login = d["login"]
-        permissions = []
-        for perm in d.get("permissions", []):
-            if perm["path"] != f"/{login}":
-                perm["path"] = perm["path"].strip()
-                permissions.append(Permission(**perm))
-        return cls(login, d["password"], permissions)
+    def __init__(self, login, password, permissions=[]):  
+        # Inicializa um usuário com login, senha e uma lista de permissões.
+        self.login = login  
+        # Define o login do usuário.
+        self.password = password  
+        # Define a senha do usuário.
+        self.base_path = Path(".")  
+        # Define o caminho base padrão como o diretório atual.
+        self.home_path = PurePosixPath(f"/{login}")  
+        # Define o caminho home do usuário baseado no login.
+        self.permissions = [Permission(f"/{login}", readable=True, writable=True)]  
+        # Adiciona permissões padrão (leitura e escrita) para o caminho home.
+        self.permissions += permissions  
+        # Adiciona permissões adicionais, se fornecidas.
+        if not [p for p in self.permissions if p.path == PurePosixPath("/")]:  
+            # Se não houver permissões para a raiz "/", adiciona uma restritiva (sem leitura ou escrita).
+            self.permissions.append(Permission("/", readable=False, writable=False))  
 
-class AbstractUserManager:
-    GetUserResponse = Enum("UserManagerResponse", "PASSWORD_REQUIRED ERROR")
+    def get_permissions(self, path):  
+        # Obtém as permissões mais específicas para um caminho.
+        path = PurePosixPath(path)  
+        # Converte o caminho fornecido para o formato POSIX.
+        parents = filter(lambda p: p.is_parent(path), self.permissions)  
+        # Filtra as permissões cujos caminhos são pais do caminho fornecido.
+        perm = min(parents, key=lambda p: len(path.relative_to(p.path).parts), default=Permission())  
+        # Seleciona a permissão mais específica com base na proximidade do caminho.
+        return perm  
 
-class MongoDBUserManager(AbstractUserManager):
-    def __init__(self, db):
-        self.db = db
-        self.available_connections = {}
-        self.users = []
+    def update(self, d):  
+        # Atualiza a senha e permissões do usuário com base em um objeto fornecido.
+        self.password = d.password or self.password  
+        # Atualiza a senha, se fornecida.
+        self.permissions.clear()  
+        # Limpa todas as permissões existentes.
+        self.permissions = [Permission(f"/{self.login}", readable=True, writable=True)]  
+        # Redefine permissões padrão para o caminho home.
+        for perm in d.permissions:  
+            # Adiciona permissões fornecidas.
+            self.permissions.append(perm)  
+        return self  
 
-    async def get_user(self, login):
-        user = User.from_dict(await self.db.users.find_one({"login": login}))
-        if user:
-            u = [usr for usr in self.users if usr.login == user.login]
-            if u:
-                user = u[0].update(user)
-            else:
-                self.users.append(user)
-            if user.login not in self.available_connections:
-                self.available_connections[user] = AvailableConnections(4)
-        if not user:
-            state = AbstractUserManager.GetUserResponse.ERROR
-            info = "no such username"
-        elif self.available_connections[user].locked():
-            state = AbstractUserManager.GetUserResponse.ERROR
-            info = f"too much connections for {user.login!r}"
-        else:
-            state = AbstractUserManager.GetUserResponse.PASSWORD_REQUIRED
-            info = "password required"
+    @classmethod  
+    def from_dict(cls, d):  
+        # Cria uma instância de User a partir de um dicionário.
+        login = d["login"]  
+        # Extrai o login do dicionário.
+        permissions = []  
+        # Inicializa a lista de permissões.
+        for perm in d.get("permissions", []):  
+            # Itera sobre as permissões fornecidas.
+            if perm["path"] != f"/{login}":  
+                # Ajusta o caminho se não corresponder ao caminho home.
+                perm["path"] = perm["path"].strip()  
+                # Remove espaços em branco do caminho.
+                permissions.append(Permission(**perm))  
+                # Adiciona a permissão formatada à lista.
+        return cls(login, d["password"], permissions)  
+        # Retorna uma nova instância de User com as permissões processadas.
 
-        if state != AbstractUserManager.GetUserResponse.ERROR:
-            self.available_connections[user].acquire()
-        return state, user, info
+class AbstractUserManager:  
+    # Classe base para o gerenciamento de usuários, contém respostas para o processo de autenticação.
+    GetUserResponse = Enum("UserManagerResponse", "PASSWORD_REQUIRED ERROR")  
+    # Enum que define os tipos de resposta para o gerenciamento de usuários: 'PASSWORD_REQUIRED' ou 'ERROR'.
 
-    async def authenticate(self, user, password):
-        return user.password == password
+class MongoDBUserManager(AbstractUserManager):  
+    # Gerenciador de usuários que se conecta ao banco de dados MongoDB.
+    
+    def __init__(self, db):  
+        # Inicializa com o banco de dados MongoDB e configura as variáveis de estado.
+        self.db = db  
+        # Define o banco de dados utilizado.
+        self.available_connections = {}  
+        # Armazena o número de conexões disponíveis para cada usuário.
+        self.users = []  
+        # Armazena os usuários carregados.
 
-    async def notify_logout(self, user):
-        self.available_connections[user].release()
+    async def get_user(self, login):  
+        # Recupera um usuário a partir do banco de dados e verifica as permissões de conexão.
+        user = User.from_dict(await self.db.users.find_one({"login": login}))  
+        # Busca o usuário no banco de dados MongoDB.
+        if user:  
+            u = [usr for usr in self.users if usr.login == user.login]  
+            # Verifica se o usuário já está na lista local de usuários.
+            if u:  
+                user = u[0].update(user)  
+                # Atualiza o usuário local se ele já existir.
+            else:  
+                self.users.append(user)  
+                # Adiciona o usuário na lista local se for novo.
+            if user.login not in self.available_connections:  
+                # Verifica se o usuário já tem conexões disponíveis.
+                self.available_connections[user] = AvailableConnections(4)  
+                # Se não, define 4 conexões disponíveis para o usuário.
+        if not user:  
+            state = AbstractUserManager.GetUserResponse.ERROR  
+            # Se o usuário não for encontrado, define o estado como 'ERROR'.
+            info = "no such username"  
+            # Mensagem de erro informando que o nome de usuário não foi encontrado.
+        elif self.available_connections[user].locked():  
+            state = AbstractUserManager.GetUserResponse.ERROR  
+            # Se o número máximo de conexões foi atingido, define o estado como 'ERROR'.
+            info = f"too much connections for {user.login!r}"  
+            # Mensagem de erro indicando que o número de conexões do usuário excedeu o limite.
+        else:  
+            state = AbstractUserManager.GetUserResponse.PASSWORD_REQUIRED  
+            # Se o usuário foi encontrado e não atingiu o limite de conexões, solicita a senha.
+            info = "password required"  
 
-class Connection(defaultdict):
-    __slots__ = ("future",)
+        if state != AbstractUserManager.GetUserResponse.ERROR:  
+            self.available_connections[user].acquire()  
+            # Se não houve erro, aumenta o número de conexões para o usuário.
 
-    class Container:
+        return state, user, info  
+        # Retorna o estado, o usuário e informações sobre o processo de autenticação.
 
-        def __init__(self, storage):
-            self.storage = storage
+    async def authenticate(self, user, password):  
+        # Método que autentica o usuário comparando a senha fornecida.
+        return user.password == password  # Retorna True se a senha for correta.
 
-        def __getattr__(self, name):
-            return self.storage[name]
+    async def notify_logout(self, user):  
+        # Notifica quando um usuário faz logout, liberando uma conexão.
+        self.available_connections[user].release()  
+        # Libera uma conexão para o usuário.
+        
+class Connection(defaultdict):  
+    # Representa uma conexão, extendendo defaultdict para armazenar resultados de futuras chamadas.
+    
+    __slots__ = ("future",)  
+    # Define os atributos permitidos para a classe, limitando o uso de memória.
 
-        def __delattr__(self, name):
-            self.storage.pop(name)
+    class Container:  
+        # Classe interna para gerenciar o armazenamento de atributos.
+        def __init__(self, storage):  
+            self.storage = storage  # Inicializa com o armazenamento fornecido.
 
-    def __init__(self, **kwargs):
-        super().__init__(Future)
-        self.future = Connection.Container(self)
-        for k, v in kwargs.items():
-            self[k].set_result(v)
+        def __getattr__(self, name):  
+            return self.storage[name]  # Retorna o valor armazenado.
 
-    def __getattr__(self, name):
-        if name in self:
-            return self[name].result()
-        else:
-            raise AttributeError(f"{name!r} not in storage")
+        def __delattr__(self, name):  
+            self.storage.pop(name)  # Deleta o valor armazenado.
 
-    def __setattr__(self, name, value):
-        if name in Connection.__slots__:
-            super().__setattr__(name, value)
-        else:
-            if self[name].done():
-                self[name] = super().default_factory()
-            self[name].set_result(value)
+    def __init__(self, **kwargs):  
+        # Inicializa a conexão com os parâmetros fornecidos.
+        super().__init__(Future)  
+        # Usa o defaultdict com o tipo de valor Future.
+        self.future = Connection.Container(self)  
+        # Cria um contêiner para armazenar os resultados das futuras chamadas.
+        for k, v in kwargs.items():  
+            self[k].set_result(v)  # Define o valor do Future imediatamente.
 
-    def __delattr__(self, name):
-        if name in self:
-            self.pop(name)
+    def __getattr__(self, name):  
+        # Sobrescreve o método __getattr__ para acessar o valor da Future.
+        if name in self:  
+            return self[name].result()  # Retorna o resultado se estiver concluído.
+        else:  
+            raise AttributeError(f"{name!r} not in storage")  
+            # Levanta um erro se o atributo não existir.
+
+    def __setattr__(self, name, value):  
+        # Sobrescreve o método __setattr__ para modificar valores armazenados.
+        if name in Connection.__slots__:  
+            super().__setattr__(name, value)  # Modifica atributos em __slots__.
+        else:  
+            if self[name].done():  
+                self[name] = super().default_factory()  # Reinicia o valor se a Future estiver concluída.
+            self[name].set_result(value)  # Define o resultado da Future.
+
+    def __delattr__(self, name):  
+        # Sobrescreve o método __delattr__ para deletar atributos armazenados.
+        if name in self:  
+            self.pop(name)  # Remove o atributo do armazenamento.
 
 class AvailableConnections:
+    # Classe que gerencia o número de conexões disponíveis.
+
     def __init__(self, value=None):
-        self.value = self.maximum_value = value
+        # Inicializa o objeto com o valor de conexões disponíveis.
+        self.value = self.maximum_value = value  # 'value' é o número inicial de conexões.
 
     def locked(self):
-        return self.value == 0
+        # Verifica se não há conexões disponíveis.
+        return self.value == 0  # Retorna True se não houver conexões restantes, caso contrário, False.
 
     def acquire(self):
+        # Diminui o número de conexões disponíveis quando uma conexão é adquirida.
         if self.value is not None:
-            self.value -= 1
-            if self.value < 0:
-                raise ValueError("Too many acquires")
+            self.value -= 1  # Diminui uma unidade de 'value'.
+            if self.value < 0:  # Se o valor for menor que zero, significa que há mais aquisições do que o permitido.
+                raise ValueError("Too many acquires")  # Lança erro.
 
     def release(self):
+        # Aumenta o número de conexões disponíveis quando uma conexão é liberada.
         if self.value is not None:
-            self.value += 1
-            if self.value > self.maximum_value:
-                raise ValueError("Too many releases")
+            self.value += 1  # Aumenta o valor de 'value'.
+            if self.value > self.maximum_value:  # Se o valor de 'value' for maior que o máximo permitido, lança erro.
+                raise ValueError("Too many releases")  # Lança erro.
 
 class ConnectionConditions:
-    user_required = ("user", "no user (use USER firstly)")
-    login_required = ("logged", "not logged in")
-    passive_server_started = ("passive_server", "no listen socket created (use PASV firstly)")
-    data_connection_made = ("data_connection", "no data connection made")
-    rename_from_required = ("rename_from", "no filename (use RNFR firstly)")
+    # Definindo as condições que devem ser verificadas em relação à conexão.
+
+    user_required = ("user", "no user (use USER firstly)")  # Condição: o usuário deve estar presente.
+    login_required = ("logged", "not logged in")  # Condição: o usuário deve estar logado.
+    passive_server_started = ("passive_server", "no listen socket created (use PASV firstly)")  # Condição: o servidor passivo deve estar iniciado.
+    data_connection_made = ("data_connection", "no data connection made")  # Condição: uma conexão de dados deve ter sido estabelecida.
+    rename_from_required = ("rename_from", "no filename (use RNFR firstly)")  # Condição: um nome de arquivo de origem deve ser fornecido.
 
     def __init__(self, *fields, wait=False, fail_code="503", fail_info=None):
-        self.fields = fields
-        self.wait = wait
-        self.fail_code = fail_code
-        self.fail_info = fail_info
+        # Inicializa as condições com os parâmetros passados.
+        self.fields = fields  # Armazena os campos que devem ser verificados.
+        self.wait = wait  # Determina se o sistema deve esperar para verificar as condições.
+        self.fail_code = fail_code  # Código de falha a ser retornado se as condições não forem atendidas.
+        self.fail_info = fail_info  # Mensagem adicional a ser retornada caso haja falha nas condições.
 
     def __call__(self, f):
+        # Torna a classe utilizável como um decorador para funções.
         @wraps(f)
         async def wrapper(cls, connection, rest, *args):
+            # Cria um dicionário de futuras verificações baseadas nos campos passados para a classe.
             futures = {connection[name]: msg for name, msg in self.fields}
-            aggregate = gather(*futures)
+            aggregate = gather(*futures)  # Junta as futuras verificações em uma operação assíncrona.
+            
+            # Define o tempo limite baseado na opção 'wait'.
             if self.wait:
-                timeout = 1
+                timeout = 1  # Tempo de espera definido para 1 segundo se 'wait' for True.
             else:
-                timeout = 0
+                timeout = 0  # Caso contrário, o tempo de espera é 0 (sem esperar).
 
             try:
+                # Aguarda a execução de todas as verificações de condições.
                 await wait_for(shield(aggregate), timeout)
             except TimeoutError:
+                # Caso o tempo de espera seja excedido, retorna uma resposta de erro para cada condição não atendida.
                 for future, message in futures.items():
                     if not future.done():
+                        # Se não estiver concluído, retorna uma resposta de falha.
                         if self.fail_info is None:
-                            info = f"bad sequence of commands ({message})"
+                            info = f"bad sequence of commands ({message})"  # Mensagem padrão de erro.
                         else:
-                            info = self.fail_info
-                        connection.response(self.fail_code, info)
+                            info = self.fail_info  # Se houver uma mensagem personalizada, usa-a.
+                        connection.response(self.fail_code, info)  # Retorna o código de falha e a mensagem.
                         return True
+            # Caso as condições sejam atendidas, chama a função original.
             return await f(cls, connection, rest, *args)
 
-        return wrapper
+        return wrapper  # Retorna o wrapper que aplica as condições à função original.
 
 class PathConditions:
-    path_must_exists = ("exists", False, "path does not exists")
-    path_must_not_exists = ("exists", True, "path already exists")
-    path_must_be_dir = ("is_dir", False, "path is not a directory")
-    path_must_be_file = ("is_file", False, "path is not a file")
+    # Define várias condições relacionadas ao caminho (path).
+    path_must_exists = ("exists", False, "path does not exists")  # O caminho deve existir, se não existir, exibe a mensagem.
+    path_must_not_exists = ("exists", True, "path already exists")  # O caminho não deve existir, se já existir, exibe a mensagem.
+    path_must_be_dir = ("is_dir", False, "path is not a directory")  # O caminho deve ser um diretório, se não for, exibe a mensagem.
+    path_must_be_file = ("is_file", False, "path is not a file")  # O caminho deve ser um arquivo, se não for, exibe a mensagem.
 
     def __init__(self, *conditions):
-        self.conditions = conditions
+        # Inicializa a classe com as condições passadas como parâmetros.
+        self.conditions = conditions  # Armazena as condições passadas.
 
     def __call__(self, f):
+        # Torna a classe utilizável como um decorador para as funções.
         @wraps(f)
         async def wrapper(cls, connection, rest, *args):
+            # Obtém os caminhos real e virtual para verificação das condições.
             real_path, virtual_path = cls.get_paths(connection, rest)
+            
+            # Itera sobre todas as condições e as verifica.
             for name, fail, message in self.conditions:
+                # Obtém o método que será chamado na verificação da condição.
                 coro = getattr(connection.path_io, name)
+                
+                # Se a condição não for atendida (resultado diferente de 'fail'), retorna a resposta de erro.
                 if await coro(real_path) == fail:
-                    connection.response("550", message)
-                    return True
+                    connection.response("550", message)  # Responde com erro 550 e a mensagem especificada.
+                    return True  # Interrompe a execução, pois a condição falhou.
+
+            # Se todas as condições forem atendidas, chama a função original.
             return await f(cls, connection, rest, *args)
 
-        return wrapper
+        return wrapper  # Retorna o wrapper que aplica as condições.
 
 class PathPermissions:
-    readable = "readable"
-    writable = "writable"
+    # Define permissões de leitura e escrita para os caminhos.
+    readable = "readable"  # Permissão para leitura.
+    writable = "writable"  # Permissão para escrita.
 
     def __init__(self, *permissions):
-        self.permissions = permissions
+        # Inicializa a classe com as permissões passadas como parâmetros.
+        self.permissions = permissions  # Armazena as permissões passadas.
 
     def __call__(self, f):
+        # Torna a classe utilizável como um decorador para as funções.
         @wraps(f)
         async def wrapper(cls, connection, rest, *args):
+            # Obtém os caminhos real e virtual para verificação das permissões.
             real_path, virtual_path = cls.get_paths(connection, rest)
+            
+            # Obtém as permissões atuais do usuário para o caminho virtual.
             current_permission = connection.user.get_permissions(virtual_path)
+            
+            # Itera sobre todas as permissões solicitadas e verifica se o usuário tem permissão.
             for permission in self.permissions:
+                # Verifica se a permissão não está presente. Se não tiver permissão, retorna um erro.
                 if not getattr(current_permission, permission):
-                    connection.response("550", "permission denied")
-                    return True
-                return await f(cls, connection, rest, *args)
+                    connection.response("550", "permission denied")  # Responde com erro 550 e a mensagem de permissão negada.
+                    return True  # Interrompe a execução, pois a permissão não foi concedida.
+            
+            # Se todas as permissões forem atendidas, chama a função original.
+            return await f(cls, connection, rest, *args)
 
-        return wrapper
+        return wrapper  # Retorna o wrapper que aplica as permissões.
 
 def worker(f):
     @wraps(f)
